@@ -1,42 +1,108 @@
-use std::net::SocketAddr;
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
+use async_graphql::http::GraphiQLSource;
+use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::{
-    routing::{get, post},
-    Json, Router,
+    response::{Html, IntoResponse},
+    routing::{get, IntoMakeService},
+    Extension, Router,
 };
+use flowist_auth::Subject;
+use graphql::GraphQLSchema;
+use hyper::{server::conn::AddrIncoming, Server};
+use oso::Oso;
+use sea_orm::DatabaseConnection;
+use serde_json::json;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, util::SubscriberInitExt};
+
+pub mod graphql;
+
+pub struct Context {
+    // The database connections
+    pub db: Arc<DatabaseConnection>,
+    // The authorization library
+    pub oso: Oso,
+}
+
+impl Context {
+    pub async fn init() -> Result<Self, Box<dyn Error>> {
+        Ok(Self {
+            oso: Oso::new(),
+            db: Arc::new(sea_orm::Database::connect("").await?),
+        })
+    }
+}
+
+/// Handle health check requests
+pub async fn health_handler() -> impl IntoResponse {
+    json!({
+        "code": "200",
+        "success": true,
+    })
+    .to_string()
+}
+
+pub async fn graphiql() -> impl IntoResponse {
+    Html(GraphiQLSource::build().endpoint("/graphql").finish())
+}
+
+/// Handle GraphQL Requests
+pub async fn graphql_handler(
+    Extension(schema): Extension<GraphQLSchema>,
+    Extension(ctx): Extension<Arc<Context>>,
+    sub: Subject,
+    req: GraphQLRequest,
+) -> GraphQLResponse {
+    // Retrieve the request User, if username is present
+    let user = if let Subject(Some(ref username)) = sub {
+        None
+        // ctx.users
+        //     .get_by_username(username, &true)
+        //     .await
+        //     .unwrap_or(None)
+    } else {
+        None
+    };
+    // Add the Subject and optional User to the context
+    let request = req.into_inner().data(sub).data(None);
+    schema.execute(request).await.into()
+}
 
 fn router() -> Router {
     Router::new()
         .route("/", get(|| async { "Hello, World!" }))
-        .route(
-            "/json",
-            post(|payload: Json<serde_json::Value>| async move {
-                Json(serde_json::json!({ "data": payload.0 }))
-            }),
-        )
+        .route("/graphql", get(graphiql).post(graphql_handler))
         // We can still add middleware
         .layer(TraceLayer::new_for_http())
 }
 
+pub async fn run(
+    context: Arc<Context>,
+) -> Result<Server<AddrIncoming, IntoMakeService<Router>>, Box<dyn Error>> {
+    let port = "";
+
+    let router = router();
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let server = axum::Server::bind(&addr).serve(router.into_make_service());
+
+    Ok(server)
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::registry()
         .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "example_testing=debug,tower_http=debug".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    // let config = get_config();
+    let context = Arc::new(Context::init().await?);
 
-    tracing::debug!("listening on {}", addr);
-    axum::Server::bind(&addr)
-        .serve(router().into_make_service())
-        .await
-        .unwrap()
+    Ok(())
 }
 
 #[cfg(test)]
